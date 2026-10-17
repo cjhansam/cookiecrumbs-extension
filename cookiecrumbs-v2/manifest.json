@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "Cookie Crumbs",
+  "version": "5.16",
+  "description": "Cookie detection, classification and privacy scoring. Datasets: CookieBlock (USENIX 2022), Open Cookie Database, Disconnect.me, Consent-O-Matic.",
+  "permissions": [
+    "cookies",
+    "scripting",
+    "webRequest",
+    "sidePanel",
+    "tabs",
+    "storage",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Cookie Crumbs"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "js": [
+        "domain_utils.js",
+        "ml_inference.js",
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "doc_cookie_hook.js",
+        "domain_utils.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}
