@@ -1,34 +1,46 @@
-# CookieCrumbs
+CookieCrumbs
+A Chrome extension that analyzes cookies on any site, scores its privacy, and protects you while you browse. Everything runs locally in your browser.
+------------------------------------------------------------------------------------------
+Features
 
-A Chrome extension that analyzes cookies on websites, scores site privacy, and protects you while you browse. Everything runs locally in your browser.
+DETECTION & CLASSIFICATION
 
-## Features
+Cookie Detection
+Sees every cookie a site sets: first-party, third-party, session, persistent, JavaScript-set, and partitioned.
 
-### Detection and classification
+Cookie Classification
+Sorts every cookie into five categories by purpose: Strict, Performance, Functionality, Advertising, and Unknown.
 
-- **Cookie detection:** Sees first-party, third-party, session, persistent, JavaScript-set, and partitioned cookies.
-- **Cookie classification:** Sorts cookies into five categories by purpose: Strict, Performance, Functionality, Advertising, and Unknown.
-- **Full cookie table:** Lists each cookie by name, party, lifespan, and security flags. Select a row for details about that cookie.
-- **Privacy score:** Shows a score from 0 to 100 with a plain-English label, based on cookie category, party, persistence, and known-tracker status.
+Full Cookie Table
+Every cookie listed by name, party, lifespan, and security flags. Click any row for details on what that specific cookie does.
 
-### Protection
+Privacy Score
+A 0–100 score for every site, with a plain-English label, based on cookie category, party, persistence, and known-tracker status.
+--------------------------------------------------------------------------------------------------
+PROTECTION
 
-- **Tracking Protection:** Blocks tracking cookies as you browse and stops tracker-domain requests at the network level. Authentication and site-essential cookies are always preserved. Tracking Protection is always on by design and has no off switch.
-- **Session Guard:** Removes weak session cookies after you leave a site. These cookies are missing Secure or HttpOnly and could be hijacked later. You can turn Session Guard on or off at any time.
-- **Consent Transparency:** Before you accept a cookie banner, CookieCrumbs pauses and shows what data will be collected and which companies will receive it.
+Tracking Protection
+Blocks tracking cookies automatically as you browse and stops tracker domains at the network level before their requests fire. Authentication and site-essential cookies are always preserved. Always on by design, with no off switch.
 
-### Controls
+Session Guard
+Removes weak session cookies after you leave a site. These are the ones missing Secure or HttpOnly that could be hijacked later. Turn it on or off anytime. 
 
-- **Per-site exemptions:** Maintain separate whitelists for Tracking Protection and Session Guard. If a site breaks, select **Exempt this site**.
-- **Settings page:** Open it using the gear icon in the panel.
+Consent Transparency
+Before you accept a cookie banner, CookieCrumbs pauses and shows what data will be collected and which companies receive it. 
+-----------------------------------------------------------------------------------------------
+CONTROL
+Per-Site Exemptions
+Two independent whitelists: one for Tracking Protection, one for Session Guard. If a site breaks, click Exempt this site.
 
-## Install
+Settings Page
+Open it from the gear icon on the panel. 
+--------------------------------------------------------------------------------------------------
 
-1. Download or clone the project.
-2. Open `chrome://extensions` in Chrome.
-3. Enable **Developer mode**.
-4. Select **Load unpacked** and choose the `cookiecrumbs-v2` folder.
+Install
+1. Download this folder
+2. Open chrome://extensions
+3. Enable Developer mode
+4. Click Load unpacked and select the folder
 
-## Requirements
-
-Chrome or another Chromium-based browser with Manifest V3 support.
+Requirements
+Chrome or any Chromium-based browser with Manifest V3 support.

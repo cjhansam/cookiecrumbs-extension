@@ -37,7 +37,81 @@ warmLocalData();
 // ── Open side panel on toolbar click ─────────────────────────
 chrome.action.onClicked.addListener(tab => {
   chrome.sidePanel.open({ tabId: tab.id });
+  reconcileContentScripts();
 });
+
+// ── Content-script reconcile (re-attach after disable→enable) ──
+// MV3 gives no "extension was enabled" event, and content scripts are NOT
+// re-injected into already-open tabs when the extension is re-enabled — the
+// old button's isolated world was destroyed at disable, leaving an orphaned
+// DOM node with no listeners (alpha report: "error appears and the floating
+// button stops working"). The probe asks each tab whether a live content
+// script world still exists (content.js sets globalThis.__ccLive = true at
+// load; the flag dies with the world). Tabs reporting nothing get the
+// manifest script set re-injected, which also sweeps the orphan node and
+// re-applies the user's widgetEnabled setting via the normal settings path.
+// Triggers: toolbar click, tab activation (single tab), and a throttled
+// sweep from SW cold start. No timers of ours are created — all event-driven.
+const CS_RECONCILE_THROTTLE_MS = 15000;
+let csReconcileLast = 0;
+const CS_PROBE = () => globalThis.__ccLive === true;
+
+async function reconcileContentScripts() {
+  try {
+    const now = Date.now();
+    if (now - csReconcileLast < CS_RECONCILE_THROTTLE_MS) return;
+    csReconcileLast = now;
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab?.id || !tab.url || !/^https?:/.test(tab.url)) continue;
+      let live = false;
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          func: CS_PROBE,
+        });
+        // "some" (not "every"): if any frame is alive, skip — re-injecting
+        // into a live world would redeclare top-level let/const bindings.
+        live = Array.isArray(results) && results.some(r => r?.result === true);
+      } catch (e) { continue; } // restricted or discarded tab
+      if (live) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          files: ["domain_utils.js", "ml_inference.js", "content.js"],
+        });
+      } catch (e) { /* restricted tab */ }
+    }
+  } catch (e) {
+    console.warn("[CC] Content-script reconcile failed:", e.message);
+  }
+}
+
+async function reconcileTab(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab?.url || !/^https?:/.test(tab.url)) return;
+    let live = false;
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: CS_PROBE,
+      });
+      live = Array.isArray(results) && results.some(r => r?.result === true);
+    } catch (e) { return; }
+    if (live) return;
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ["domain_utils.js", "ml_inference.js", "content.js"],
+    });
+  } catch (e) { /* restricted tab */ }
+}
+
+// Cold-start sweep: the SW starts the moment the extension is enabled, so
+// this covers the enable case (throttled — the SW also wakes on every
+// cookie event, and probing all tabs on every wake would be wasteful).
+reconcileContentScripts();
 
 const savedCookieTracking = new Map();
 let riskBlockingJustEnabled = false;
@@ -77,13 +151,24 @@ chrome.storage.local.get("ccDiagLog", data => {
 // cookie verdict (BLOCKED / PURGED / KEPT + reason code + siteKey and
 // origin AT DECISION TIME + trigger + toggle snapshot) so a single
 // sidepanel export answers "who did it" without console-diving.
-// Cap 200 rows, evict-oldest; debounced persist mirrors ccDiagLog so
-// evidence survives worker restarts (modulo the final ~5s window).
-const DECISION_RECEIPTS_MAX = 200;
+// Cap 500 rows, kill-biased eviction: BLOCKED/PURGED rows are never evicted
+// while any KEPT row exists (KEEP noise from busy scans must not drown the
+// evidence a logout investigation needs), and kill rows flush to storage
+// immediately instead of waiting for the 5s KEEP debounce — the persisted
+// copy keeps them too. Debounced persist still mirrors the rest.
+const DECISION_RECEIPTS_MAX = 500;
 const decisionReceipts = [];
 let decisionReceiptsFlushTimer = null;
+function flushDecisionReceipts() {
+  if (decisionReceiptsFlushTimer) {
+    clearTimeout(decisionReceiptsFlushTimer);
+    decisionReceiptsFlushTimer = null;
+  }
+  try { chrome.storage.local.set({ ccDecisionReceipts: decisionReceipts.slice(-DECISION_RECEIPTS_MAX) }); } catch (e) {}
+}
 function recordDecision(entry) {
   try {
+    const verdict = entry.verdict || "KEPT";
     decisionReceipts.push({
       t: Date.now(),
       tabId: entry.tabId ?? null,
@@ -97,18 +182,26 @@ function recordDecision(entry) {
       secure: !!entry.secure,
       fromDocCookie: !!entry.fromDocCookie,
       session: !!entry.session,
-      verdict: entry.verdict || "KEPT",
+      verdict,
       reason: entry.reason || "NOT_BLOCKED",
       cat: entry.cat || "?",
       trigger: entry.trigger || "",
       tb: !!entry.tb,
       sg: !!entry.sg,
     });
-    while (decisionReceipts.length > DECISION_RECEIPTS_MAX) decisionReceipts.shift();
+    while (decisionReceipts.length > DECISION_RECEIPTS_MAX) {
+      let idx = decisionReceipts.findIndex(e => e.verdict !== "BLOCKED" && e.verdict !== "PURGED");
+      if (idx < 0) idx = 0;
+      decisionReceipts.splice(idx, 1);
+    }
+    if (verdict === "BLOCKED" || verdict === "PURGED") {
+      flushDecisionReceipts();
+      return;
+    }
     if (!decisionReceiptsFlushTimer) {
       decisionReceiptsFlushTimer = setTimeout(() => {
         decisionReceiptsFlushTimer = null;
-        try { chrome.storage.local.set({ ccDecisionReceipts: decisionReceipts.slice(-DECISION_RECEIPTS_MAX) }); } catch (e) {}
+        flushDecisionReceipts();
       }, 5000);
     }
   } catch (e) {}
@@ -162,6 +255,8 @@ async function preloadSessionCache() {
         s: new Set(entry.s || []),
         d: new Map(Object.entries(entry.d || {})),
         c: Array.isArray(entry.c) ? entry.c : [],
+        k: entry.k || "",
+        u: entry.u || "",
       };
     }
   } catch(e) { console.warn("[CC]", e.message); }
@@ -198,12 +293,17 @@ function saveSessionState(tabId, state) {
     s: new Set(state.cookiesSetBySite),
     d: new Map(state.domains),
     c: cookiesSnapshot,
+    // Identity fields: without these, a worker restart restores the tab as a
+    // blank-siteKey virgin (URL and siteKey lost), which blinds the Session
+    // Guard cross-tab guard and re-opens the foreign-tab judgment window.
+    k: state.siteKey || "",
+    u: state.url || "",
   };
   clearTimeout(saveSessionTimer);
   saveSessionTimer = setTimeout(() => {
     const out = {};
     for (const [id, e] of Object.entries(sessionCache)) {
-      out[id] = { s: [...e.s], d: Object.fromEntries(e.d), c: e.c || [] };
+      out[id] = { s: [...e.s], d: Object.fromEntries(e.d), c: e.c || [], k: e.k || "", u: e.u || "" };
     }
     try { chrome.storage.session.set({ ccTabState: out }); } catch(e) { console.warn("[CC]", e.message); }
   }, 500);
@@ -564,6 +664,64 @@ const WEAK_AUTH_DOMAIN_HINT_RE = /(^|[.-])(security|secure|verify|verification|c
  *   OpenID Connect discovery document — standard auth URL paths.
  */
 const AUTH_FLOW_URL_RE = /(^|[/?#&=._-])(account|accounts|auth|authorize|login|signin|signon|sso|oauth|openid|idp|identity|security|secure|verify|verification|challenge|mfa|2fa|password)([/?#&=._-]|$)/i;
+
+/**
+ * CAPTCHA_INFRA_HOSTS / isCaptchaInfraDomain: Known captcha and bot-verification
+ *   infrastructure hosts (E6 exemption + DNR seeding guard).
+ * WHY IT EXISTS: Challenge cookies (__cflb, __cf_bm on hcaptcha.com / challenges.
+ *   cloudflare.com, …) are third-party, persistent, and labeled Functionality by
+ *   the name-level DB lookup — exactly what B4 (ruleFunc3p) and the DNR domain
+ *   seeding table block on every site. The domain record in cookie_db.json says
+ *   Strict / disconnect_cat "Anti-fraud" for these vendors, but name beats domain
+ *   in the classification cascade, so E0 never sees them. Removing them mid-flow
+ *   breaks the issue→verify round trip (hCaptcha __cflb load-balancer affinity:
+ *   the challenge is issued by one api.hcaptcha.com node and must be verified by
+ *   the same node) and the site's login fails — demonstrated on claude.ai via a
+ *   whitelist A/B (login works whitelisted / fails otherwise) and the 43-vs-35
+ *   cookie diff (captcha cookies present only in the working session).
+ * LIST PROVENANCE: DB-seeded — reproducible query against cookie_db.json:
+ *     Object.entries(db.domains).filter(([k, v]) => v.disconnect_cat === "Anti-fraud")
+ *   returns 30 hosts, all cat "Strict"; the challenge/bot-verification class of
+ *   that set is kept (hcaptcha, recaptcha.net, DataDome, Arkose, GeeTest,
+ *   HUMAN/PerimeterX). Two manual additions follow (Cloudflare Turnstile's
+ *   challenges.cloudflare.com and Friendly Captcha are not separate DB hosts —
+ *   cloudflare.com itself is Advertising-classified and must NOT be matched).
+ * HOW IT WORKS: Suffix match with dot boundary on the normalized host (host === h
+ *   || host.endsWith("." + h)) — deliberately NOT registrable-domain matching, so
+ *   challenges.cloudflare.com matches while other cloudflare.com subdomains do not.
+ *   Advertising/Performance cookies on these hosts are still judged normally (the
+ *   E6 category guard lives in isExemptFromRiskBlocking); the DNR guard is
+ *   domain-level because a challenge widget's scripts are the service itself.
+ * INPUT: Cookie domain or host string.
+ * OUTPUT: Boolean — true if the domain is captcha/bot-verification infrastructure.
+ * Source: cookie_db.json (Disconnect.me taxonomy "Anti-fraud"); ePrivacy Directive
+ *   Article 5(3) — strictly necessary for the requested service; ICO guidance —
+ *   security and fraud-prevention cookies are strictly necessary.
+ */
+const CAPTCHA_INFRA_HOSTS = new Set([
+  // DB-seeded (cookie_db.json disconnect_cat === "Anti-fraud", challenge class)
+  "hcaptcha.com",
+  "recaptcha.net",
+  "captcha-delivery.com",
+  "datadome.co",
+  "arkoselabs.com",
+  "funcaptcha.com",
+  "geetest.com",
+  "perimeterx.com",
+  "perimeterx.net",
+  // Manual additions (not separate hosts in cookie_db.json)
+  "challenges.cloudflare.com",
+  "friendly-captcha.com",
+]);
+function isCaptchaInfraDomain(d) {
+  const host = normalizeHost(d || "");
+  if (!host || !host.includes(".")) return false;
+  for (const h of CAPTCHA_INFRA_HOSTS) {
+    if (host === h || host.endsWith("." + h)) return true;
+  }
+  return false;
+}
+
 /**
  * GOOGLE_OWNED_HOSTS: Full inventory of Google-operated domains (search front-ends,
  *   service infrastructure, content delivery). Used ONLY for Google-property
@@ -843,7 +1001,7 @@ function getState(tabId) {
         cookies.set(key, entry);
         preExistingKeys.add(key);
       }
-      tabState[tabId] = { url:"", siteKey:"", domains: new Map(c.d), cookies, preExistingKeys, cookiesSetBySite: new Set(c.s), lastActiveAt:Date.now(), authMode:false };
+      tabState[tabId] = { url: c.u || "", siteKey: c.k || "", domains: new Map(c.d), cookies, preExistingKeys, cookiesSetBySite: new Set(c.s), lastActiveAt:Date.now(), authMode:false };
       delete sessionCache[tabId];
       ccDiag({ ev:"state_restore_session", tabId, setBySite: tabState[tabId].cookiesSetBySite.size, domains: tabState[tabId].domains.size, restoredCookies: cookies.size });
     } else {
@@ -2159,7 +2317,14 @@ async function purgeRiskySessionCookiesForState(tabId, state, trigger) {
     if (leavingSite) {
       for (const [otherTabId, otherState] of Object.entries(tabState)) {
         if (Number(otherTabId) === tabId) continue;
-        if (normalizeHost(otherState?.siteKey || "") === leavingSite) {
+        // siteKey may still be blank on a just-restored tab (pre-snapshot
+        // format or a tab that hasn't re-stamped since worker restart) —
+        // fall back to the URL host so the guard fails open neither way.
+        let otherSite = normalizeHost(otherState?.siteKey || "");
+        if (!otherSite && otherState?.url) {
+          try { otherSite = getRegistrableDomain(new URL(otherState.url).hostname); } catch (e) {}
+        }
+        if (otherSite && otherSite === leavingSite) {
           recordDecision({ tabId, site: leavingSite, origin: "", name: "", domain: "", path: "-", url: state?.url || "", httpOnly: false, secure: false, fromDocCookie: false, session: false, verdict: "KEPT", reason: "LAYER1_SITE_OPEN", trigger, tb: riskBlockingSettings.riskBlockingEnabled, sg: true });
           return 0;
         }
@@ -2370,26 +2535,80 @@ function isLikelyAuthInfrastructureDomain(domain, db) {
 }
 
 /**
+ * authSafeCrossTabHome: True when a cookie's registrable domain is the home site
+ *   of some OTHER open tab and the cookie's domain is auth-safe platform
+ *   infrastructure (isAuthSafeHost — Google auth-state hosts + Facebook/
+ *   Microsoft/Apple/GitHub).
+ * WHY IT EXISTS: chrome.cookies.remove() deletes globally. A Google companion
+ *   cookie (NID, COMPASS, OTZ, LSID, … — not in AUTH_COOKIE_NAMES) judged by a
+ *   foreign tab (a news site that merely contacted google.com, winning
+ *   cookie-set attribution or scan queries by recency) reads as third-party,
+ *   loses the E4 first-party auth-infra exemption, matches Advertising in the
+ *   database, and is deleted — killing the session held by the open Gmail tab
+ *   minutes later via Google's server-side invalidation. Observed as: idle
+ *   multi-account Gmail logout with Session Guard off, intermittent, delayed.
+ *   The old GOOGLE_DOMAIN blanket exemption covered this but also shielded
+ *   Google's 3P ad cookies everywhere; this rescue is the narrow replacement —
+ *   it fires only when another open tab actually LIVES on that domain.
+ * HOW IT WORKS: Requires isAuthSafeHost(cookieDomain) — non-auth-safe tracker
+ *   domains (doubleclick.net etc.) are still blocked on foreign sites even if
+ *   another tab contacted them. Then scans tabState for any other tab whose
+ *   siteKey equals the cookie's registrable domain (blank siteKey falls back
+ *   to the tab URL host, covering just-restored tabs). The judging tab itself
+ *   never counts as "other" — if it did, E4 would already have matched.
+ * INPUT: cookie (cookie object with domain).
+ * OUTPUT: Boolean — true if an auth-safe cookie should be kept for another tab's sake.
+ * Source: chrome.cookies API — chrome.cookies.remove is browser-global, not per-tab;
+ *   multi-account session invalidation — Google companion-cookie dependencies
+ *   (the SID family alone is not the full session key).
+ */
+function authSafeCrossTabHome(cookie) {
+  const cookieHost = normalizeHost(cookie?.domain || "");
+  if (!cookieHost) return false;
+  if (!isAuthSafeHost(cookieHost)) return false;
+  const reg = getRegistrableDomain(cookieHost);
+  if (!reg) return false;
+  for (const otherState of Object.values(tabState)) {
+    if (!otherState) continue;
+    let sk = normalizeHost(otherState.siteKey || "");
+    if (!sk && otherState.url) {
+      try { sk = getRegistrableDomain(new URL(otherState.url).hostname); } catch (e) {}
+    }
+    if (sk && sk === reg) return true;
+  }
+  return false;
+}
+
+/**
  * isExemptFromRiskBlocking: Determines if a cookie should be exempt from risk-based
- *   blocking based on the Strict + E2-E4 exemption rules.
+ *   blocking based on the Strict + E2-E6 exemption rules.
  * WHY IT EXISTS: Risk blocking must not break legitimate functionality. Certain cookies
  *   — Strictly-necessary labels (STRICT_EXEMPT), session/auth cookies without tracking
- *   hints (E2), cookies on login pages (E3), and first-party auth infrastructure
- *   cookies (E4) — must be allowed through even if they match blocking rules.
- *   Without exemptions, the system would block Google's SID cookie on docs.google.com
- *   (E4), break login flows on auth pages (E3), and remove legitimate session cookies (E2).
+ *   hints (E2), cookies on login pages (E3), first-party auth infrastructure
+ *   cookies (E4), auth-safe cookies that are the home site of another open tab (E5),
+ *   and captcha/bot-verification infrastructure cookies (E6) — must be allowed through
+ *   even if they match blocking rules. Without exemptions, the system would block
+ *   Google's SID cookie on docs.google.com (E4), break login flows on auth pages (E3),
+ *   remove legitimate session cookies (E2), log the user out of a Gmail tab in
+ *   another window (E5), and break every hCaptcha/Turnstile-dependent login (E6).
  * HOW IT WORKS: Checks exemption conditions in order:
  *   1) Strict label → STRICT_EXEMPT (immune to everything in Tracker Blocking).
  *   2) isSessionExempt: session-like cookie that is NOT a third-party tracking vendor
  *      cookie (E2). Also requires the cookie to have a known category (not Unknown).
  *   3) AUTH_MODE: tab is on a login page (E3).
  *   4) AUTH_INFRA_FIRSTPARTY: first-party cookie on auth infrastructure domain (E4).
+ *   5) CROSS_TAB_HOME: auth-safe cookie whose domain is the current site of another
+ *      open tab (E5) — removing it globally would log that tab out.
+ *   6) CAPTCHA_INFRA: Functionality/Unknown cookie on known captcha infrastructure
+ *      (E6) — the challenge round trip depends on it (see CAPTCHA_INFRA_HOSTS).
  *   Returns the exemption reason string if exempt, null otherwise.
  * INPUT: cookie (cookie object), analysis (getSessionAnalysis output), state (tab state),
  *   db (cookie database).
- * OUTPUT: String ("STRICT_EXEMPT" | "SESSION_AUTH_EXEMPT" | "AUTH_MODE" | "AUTH_INFRA_FIRSTPARTY") or null.
+ * OUTPUT: String ("STRICT_EXEMPT" | "SESSION_AUTH_EXEMPT" | "AUTH_MODE" |
+ *   "AUTH_INFRA_FIRSTPARTY" | "CROSS_TAB_HOME" | "CAPTCHA_INFRA") or null.
  * Source: Privacy-by-design principles — exemptions for essential functionality;
- *   ePrivacy Directive Article 5(3) — exemption for technical storage.
+ *   ePrivacy Directive Article 5(3) — exemption for technical storage;
+ *   ICO guidance — security/fraud-prevention cookies are strictly necessary (E6).
  */
 function isExemptFromRiskBlocking(cookie, analysis, state, db) {
   // Strict immunity: a Strictly Necessary label is treated as a guarantee —
@@ -2402,6 +2621,18 @@ function isExemptFromRiskBlocking(cookie, analysis, state, db) {
   if ((isSessionExempt || analysis.isAuthLike) && analysis.cat !== "Unknown") return "SESSION_AUTH_EXEMPT";
   if (state?.authMode) return "AUTH_MODE";
   if (analysis.authInfra && !thirdParty) return "AUTH_INFRA_FIRSTPARTY";
+  // Cross-tab home rescue (auth-safe hosts only): the cookie's domain is the
+  // current site of another open tab, so removing it globally would log that
+  // tab out. Narrow by design — see authSafeCrossTabHome.
+  if (authSafeCrossTabHome(cookie)) return "CROSS_TAB_HOME";
+  // Captcha/bot-verification infrastructure (E6): challenge cookies must
+  // survive their own flow — hCaptcha __cflb is load-balancer affinity, so a
+  // mid-flow deletion makes the verify call hit the wrong node and the login
+  // fails. Category-scoped: Strict is already returned by E0 above; only
+  // Functionality/Unknown are rescued here — Advertising/Performance cookies
+  // on these hosts are still judged by the rule table.
+  if ((analysis.cat === "Functionality" || analysis.cat === "Unknown") &&
+      isCaptchaInfraDomain(cookie?.domain || "")) return "CAPTCHA_INFRA";
   return null;
 }
 
@@ -2585,6 +2816,10 @@ function getSuppressedTrackingCookie(cookie) {
 function rememberBlockedDomain(domain) {
   const clean = normalizeHost(domain);
   if (!clean) return;
+  // Captcha infra never seeds DNR rules (domain layer of E6): the domain's
+  // scripts ARE the challenge widget — network-blocking ||hcaptcha.com^ kills
+  // the login flow on every embedding site even when cookie verdicts are KEPT.
+  if (isCaptchaInfraDomain(clean)) return;
   stickyBlockedDomains.add(clean);
   const reg = getRegistrableDomain(clean);
   if (reg) stickyBlockedDomains.add(reg);
@@ -2614,6 +2849,10 @@ function promoteSuppressedTrackingSource(entry, db, blockedDomains) {
   const domain = normalizeHost(entry?.domain || "");
   if (!domain || !blockedDomains) return;
   if (isLikelyAuthInfrastructureDomain(domain, db)) return;
+  // Captcha infrastructure (E6 domain layer): never promote to blocked domains —
+  // a suppressed challenge cookie must not escalate into a network block of the
+  // challenge service itself.
+  if (isCaptchaInfraDomain(domain)) return;
   // Logout-trap fix: never escalate a login-flavored entry to the sticky
   // blocklist, even at count >= 2. Legacy entries without the flag keep the
   // old behavior (flag absent = falsy = eligible as before).
@@ -2640,14 +2879,20 @@ function promoteSuppressedTrackingSource(entry, db, blockedDomains) {
 //   2. Safety net   → SESSION_SAFETY_NET (session-shaped 1p HttpOnly) → ALLOW
 //   3. Rule table   → 9 rules OR'd; first true term names the receipt label
 //
-// Rules (9 blocking + 5 exemptions + 2 refinements — defensible to panel):
-//   Exemptions (5):
+// Rules (9 blocking + 7 exemptions + 2 refinements — defensible to panel):
+//   Exemptions (7):
 //     E0. Strict label (STRICT_EXEMPT — immune to everything below)
 //     E1. Protected auth cookie (SID, HSID, etc.)
 //     E2. Session/auth-like without tracking hint
 //     E3. Auth mode (login page active)
 //     E4. Auth-infra first-party (google.com cookies on docs.google.com)
-//     (Removed: Google domain blanket — superseded by E1-E4; third-party
+//     E5. Cross-tab home (auth-safe cookie is the home site of another open
+//         tab — removal would log that tab out; Gmail multi-account fix)
+//     E6. Captcha infrastructure (Functionality/Unknown cookie on a known
+//         captcha/bot-verification host — the challenge round trip depends on
+//         it; hosts DB-seeded from cookie_db.json Anti-fraud class. Domain
+//         layer also guards DNR seeding so ||hcaptcha.com^ is never ruled.)
+//     (Removed: Google domain blanket — superseded by E1-E6; third-party
 //      Google ad cookies are blocked like any other tracker. Verified by
 //      Gmail-stays-logged-in test.)
 //   Classification rules (C1-C3, first-party Advertising/Unknown need
@@ -2824,6 +3069,10 @@ async function getTrackingRiskAnalysis(cookie, state, db) {
  * Source: N/A — reappearance tracking pattern for persistent enforcement.
  */
 function rememberSuppressedTrackingCookie(cookie, analysis) {
+  // Captcha infrastructure (E6 domain layer): no suppression entry is created,
+  // so the domain can never be escalated into a DNR rule (the entry is also
+  // unreachable elsewhere — SG's scope guard excludes these hosts).
+  if (isCaptchaInfraDomain(cookie?.domain || "")) return;
   const previous = getSuppressedTrackingCookie(cookie);
   const payload = {
     name: cookie.name,
@@ -3142,7 +3391,7 @@ async function syncTrackerBlockingRules() {
     const db = await getRiskData();
     const blockedDomains = new Set();
     for (const domain of stickyBlockedDomains) {
-      if (/^[a-z0-9.-]+$/.test(domain) && domain.includes(".") && !isLikelyAuthInfrastructureDomain(domain, db)) {
+      if (/^[a-z0-9.-]+$/.test(domain) && domain.includes(".") && !isLikelyAuthInfrastructureDomain(domain, db) && !isCaptchaInfraDomain(domain)) {
         blockedDomains.add(domain);
       }
     }
@@ -3176,7 +3425,7 @@ async function syncTrackerBlockingRules() {
           (thirdParty && effectivelyPersistent && category === "Functionality");
         if (!shouldBlock) continue;
         const domain = normalizeHost(cookie?.domain || "");
-        if (!domain || isLikelyAuthInfrastructureDomain(domain, db)) continue;
+        if (!domain || isLikelyAuthInfrastructureDomain(domain, db) || isCaptchaInfraDomain(domain)) continue;
         rememberBlockedDomain(domain);
         blockedDomains.add(domain);
         const reg = getRegistrableDomain(domain);
@@ -3517,6 +3766,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onActivated.addListener(info => {
   if (!Number.isInteger(info?.tabId)) return;
   touchTab(info.tabId);
+  reconcileTab(info.tabId); // re-attach content scripts if the world died (disable→enable)
   chrome.tabs.get(info.tabId, tab => {
     if (chrome.runtime.lastError || !tab?.url) return;
     const state = getState(info.tabId);

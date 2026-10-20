@@ -98,22 +98,20 @@ let ML = null;
 let widgetEl = null;
 let widgetNewBadgeTimer = null;
 let lastWidgetCookieCount = 0;
-let widgetPos = null;
-let widgetDragging = false;
-let widgetDragMoved = false;
-let widgetPanelOpen = false;
-let prePanelWidgetPos = null;
 let widgetEnabled = false;
 let ccEnabled = true;
 let consentAnalysisEnabled = true;
-let _onWidgetMouseMove = null;
-let _onWidgetMouseUp = null;
 let currentTabId = null;
 let docCookieRefreshTimer = null;
 let authContextTimer = null;
 let lastAuthContextState = null;
 let widgetRefreshTimer = null;
 const IS_TOP_FRAME = window.top === window;
+// Probe marker for the background reconcile (re-attach after disable→enable).
+// The isolated world is destroyed when the extension is disabled, which
+// destroys this flag with it; a fresh executeScript probe then sees it
+// missing and re-injects the content scripts into the tab.
+globalThis.__ccLive = true;
 const AUTH_CONTEXT_URL_RE = /(^|[/?#&=._-])(account|accounts|auth|authorize|login|signin|signon|sso|oauth|openid|idp|identity|security|secure|verify|verification|challenge|mfa|2fa|password)([/?#&=._-]|$)/i;
 
 /**
@@ -135,13 +133,18 @@ const AUTH_CONTEXT_URL_RE = /(^|[/?#&=._-])(account|accounts|auth|authorize|logi
  */
 function requestLocalData() {
   return new Promise(resolve => {
-    chrome.runtime.sendMessage({ type: "GET_LOCAL_DATA" }, resp => {
-      if (chrome.runtime.lastError) {
-        resolve({ cookieDb: null, modelWeights: null });
-        return;
-      }
-      resolve(resp || { cookieDb: null, modelWeights: null });
-    });
+    try {
+      chrome.runtime.sendMessage({ type: "GET_LOCAL_DATA" }, resp => {
+        if (chrome.runtime.lastError) {
+          resolve({ cookieDb: null, modelWeights: null });
+          return;
+        }
+        resolve(resp || { cookieDb: null, modelWeights: null });
+      });
+    } catch (e) {
+      // Extension context invalidated (extension disabled mid-flight).
+      resolve({ cookieDb: null, modelWeights: null });
+    }
   });
 }
 
@@ -231,18 +234,14 @@ async function loadModel(data) {
  * HOW IT WORKS:
  *   1. If `widgetEl` exists, calls `widgetEl.remove()` to detach from DOM.
  *   2. Sets `widgetEl = null`.
- *   3. Removes document-level `mousemove` and `mouseup` listeners used for
- *      drag behavior, then nulls their references.
- * INPUT: None (operates on global `widgetEl` and listener references).
- * OUTPUT: Modifies DOM (removes widget) and cleans up global state.
+ * INPUT: None (operates on the global `widgetEl` reference).
+ * OUTPUT: Modifies DOM (removes widget) and clears global state.
  */
 function removeWidget() {
   if (widgetEl) {
     widgetEl.remove();
     widgetEl = null;
   }
-  if (_onWidgetMouseMove) { document.removeEventListener("mousemove", _onWidgetMouseMove); _onWidgetMouseMove = null; }
-  if (_onWidgetMouseUp) { document.removeEventListener("mouseup", _onWidgetMouseUp); _onWidgetMouseUp = null; }
 }
 
 /**
@@ -327,9 +326,7 @@ function applySettings() {
     return;
   }
   if (document.body || document.documentElement) {
-    const existed = !!document.getElementById("cc-score-widget");
     ensureWidget();
-    if (!existed && widgetPanelOpen) updateWidgetPanelState(true);
   }
   startWidgetPolling();
   refreshWidget();
@@ -1356,57 +1353,28 @@ function widgetScoreText(score) {
 }
 
 /**
- * applyWidgetPosition: Apply the saved or default position to the widget
- *   element using CSS `!important` overrides.
- * WHY IT EXISTS: The widget is a fixed-position floating element that the user
- *   can drag. Its position must be restored from `chrome.storage.local` on
- *   load (for persistence across page loads) or defaulted to top-right. This
- *   function ensures the widget appears in the correct location regardless of
- *   how the page's own styles might try to position it. Without `!important`
- *   overrides, page stylesheets could relocate the widget to unexpected
- *   positions.
- * HOW IT WORKS:
- *   1. If `widgetPos` exists (user has dragged the widget), sets `top` and
- *      `left` to the saved coordinates, and `right: auto`.
- *   2. Otherwise, applies defaults: `top: 88px`, `right: 18px`, `left: auto`.
- * INPUT: None (reads globals `widgetEl`, `widgetPos`).
- * OUTPUT: Modifies `widgetEl`'s inline styles.
- */
-function applyWidgetPosition() {
-  if (!widgetEl) return;
-  if (widgetPos) {
-    widgetEl.style.setProperty("top", widgetPos.y + "px", "important");
-    widgetEl.style.setProperty("right", "auto", "important");
-    widgetEl.style.setProperty("left", widgetPos.x + "px", "important");
-  } else {
-    widgetEl.style.setProperty("top", "88px", "important");
-    widgetEl.style.setProperty("right", "18px", "important");
-    widgetEl.style.setProperty("left", "auto", "important");
-  }
-}
-
-/**
  * ensureWidget: Create the floating score widget DOM element if it doesn't
- *   exist, set up drag behavior, and attach it to the page.
+ *   exist and attach it to the page, pinned to the bottom-right corner.
  * WHY IT EXISTS: The widget is the primary user-facing element of the
- *   extension — a draggable floating circle showing the privacy score. It
- *   must be created once, positioned correctly, and made interactive (draggable,
- *   clickable to open side panel). This function encapsulates the entire widget
- *   lifecycle: DOM creation, style injection, position restoration from storage,
- *   drag-and-drop event handling, hover animations, and click-to-toggle-panel.
- *   Without this function, the widget would not exist and users would have no
- *   visual indicator of privacy quality.
+ *   extension — a floating circle showing the privacy score. Alpha testing
+ *   found that the earlier draggable design "sometimes sits on top of
+ *   important parts of a website", "can end up in odd places", and gets
+ *   lost ("where did it go"). A single fixed anchor is easier to find and
+ *   cannot be displaced by the page. Dragging has been removed entirely.
  * HOW IT WORKS:
  *   1. Guards: returns null if widget is disabled, not top frame, or already exists.
- *   2. Creates a `<button>` element with fixed positioning, circular shape (64x64px),
- *      z-index of 2147483645 (near max), and three child spans (title, score value, badge).
- *   3. Restores position from `chrome.storage.local` and applies it.
- *   4. Sets up mousedown/mousemove/mouseup for drag behavior with a 3px threshold
- *      to distinguish clicks from drags.
- *   5. Persists new position to storage on drag end.
- *   6. Adds hover animations (subtle translateY + scale).
- *   7. On click (not drag), sends `TOGGLE_SIDEPANEL` to open the side panel.
- *   8. Appends to `document.body` or `document.documentElement`.
+ *   2. Orphan sweep: removes any leftover #cc-score-widget node. When our own
+ *      `widgetEl` is null, an existing node with that ID can only be an orphan
+ *      from a dead isolated world (extension was disabled then re-enabled) —
+ *      it has no listeners. Removing it first guarantees a working button and
+ *      prevents duplicates after a background re-injection.
+ *   3. Creates a `<button>` element fixed at bottom-right (18px margins),
+ *      circular shape (64x64px), z-index 2147483645, and three child spans
+ *      (title, score value, badge). The one-time storage cleanup removes the
+ *      legacy drag-position key so old installs stop carrying dead state.
+ *   4. Adds hover animations (subtle translateY + scale).
+ *   5. On click, sends `TOGGLE_SIDEPANEL` to open the side panel.
+ *   6. Appends to `document.body` or `document.documentElement`.
  * INPUT: None (reads globals `widgetEnabled`, `IS_TOP_FRAME`, `widgetEl`).
  * OUTPUT: Returns the created `widgetEl` Element, or null if not created.
  */
@@ -1415,14 +1383,18 @@ function ensureWidget() {
   if (widgetEl) return widgetEl;
   if (!document.body && !document.documentElement) return null;
 
+  const orphan = document.getElementById("cc-score-widget");
+  if (orphan) orphan.remove();
+
   widgetEl = document.createElement("button");
   widgetEl.id = "cc-score-widget";
   widgetEl.type = "button";
+  widgetEl.setAttribute("aria-label", "Cookie Crumbs privacy score");
   widgetEl.setAttribute("style", `
-    position:fixed!important;right:18px!important;top:88px!important;z-index:2147483645!important;
+    position:fixed!important;right:18px!important;bottom:18px!important;top:auto!important;left:auto!important;z-index:2147483645!important;
     width:64px!important;height:64px!important;border-radius:999px!important;
     border:3px solid #ffffff!important;background:#ffffff!important;color:#333333!important;
-    box-shadow:none!important;outline:none!important;cursor:grab!important;
+    box-shadow:none!important;outline:none!important;cursor:pointer!important;
     display:flex!important;align-items:center!important;justify-content:center!important;
     flex-direction:column!important;padding:0!important;font-family:'JetBrains Mono',monospace!important;
     transition:transform .16s ease, border-color .16s ease!important;
@@ -1436,119 +1408,19 @@ function ensureWidget() {
     <span id="cc-score-widget-badge" style="display:none!important;position:absolute!important;top:-6px!important;right:-6px!important;background:#ff4d6e!important;color:#fff!important;border-radius:999px!important;padding:2px 6px!important;font-size:9px!important;font-weight:700!important;border:2px solid #ffffff!important">+0</span>
   `;
 
-  chrome.storage.local.get({ widgetPos: null }, res => {
-    widgetPos = res.widgetPos || null;
-    applyWidgetPosition();
-  });
+  // One-time migration: drop the legacy drag-position key from older installs.
+  try { chrome.storage.local.remove("widgetPos"); } catch (e) { /* context invalidated */ }
 
-  let dragOffsetX = 0, dragOffsetY = 0, dragStartX = 0, dragStartY = 0;
-
-  widgetEl.addEventListener("mousedown", (e) => {
-    e.stopPropagation();
-    widgetDragging = true;
-    widgetDragMoved = false;
-    const rect = widgetEl.getBoundingClientRect();
-    dragOffsetX = e.clientX - rect.left;
-    dragOffsetY = e.clientY - rect.top;
-    dragStartX = e.clientX;
-    dragStartY = e.clientY;
-    widgetEl.style.cursor = "grabbing";
-  });
-
-  _onWidgetMouseMove = (e) => {
-    if (!widgetDragging) return;
-    const dx = Math.abs(e.clientX - dragStartX);
-    const dy = Math.abs(e.clientY - dragStartY);
-    if (dx > 3 || dy > 3) widgetDragMoved = true;
-    if (!widgetDragMoved) return;
-
-    let newX = e.clientX - dragOffsetX;
-    let newY = e.clientY - dragOffsetY;
-
-    const w = widgetEl.offsetWidth || 64;
-    const h = widgetEl.offsetHeight || 64;
-    newX = Math.max(0, Math.min(newX, window.innerWidth - w));
-    newY = Math.max(0, Math.min(newY, window.innerHeight - h));
-
-    widgetEl.style.setProperty("left", newX + "px", "important");
-    widgetEl.style.setProperty("top", newY + "px", "important");
-    widgetEl.style.setProperty("right", "auto", "important");
-  };
-  document.addEventListener("mousemove", _onWidgetMouseMove);
-
-  _onWidgetMouseUp = () => {
-    if (!widgetDragging) return;
-    widgetDragging = false;
-    widgetEl.style.cursor = "grab";
-    if (!widgetDragMoved) return;
-
-    const rect = widgetEl.getBoundingClientRect();
-    widgetPos = { x: rect.left, y: rect.top };
-    chrome.storage.local.set({ widgetPos });
-  };
-  document.addEventListener("mouseup", _onWidgetMouseUp);
-
-  widgetEl.addEventListener("mouseenter", () => { if (!widgetDragging) widgetEl.style.transform = "translateY(-1px) scale(1.03)"; });
-  widgetEl.addEventListener("mouseleave", () => { if (!widgetDragging) widgetEl.style.transform = "none"; });
+  widgetEl.addEventListener("mouseenter", () => { widgetEl.style.transform = "translateY(-1px) scale(1.03)"; });
+  widgetEl.addEventListener("mouseleave", () => { widgetEl.style.transform = "none"; });
   widgetEl.addEventListener("click", (e) => {
-    if (widgetDragMoved) { widgetDragMoved = false; e.stopPropagation(); return; }
+    e.stopPropagation();
     try {
-      chrome.runtime.sendMessage({ type: "TOGGLE_SIDEPANEL" });
-    } catch(err) { console.warn("[CC]", err.message); }
+      chrome.runtime.sendMessage({ type: "TOGGLE_SIDEPANEL" }, () => void chrome.runtime.lastError);
+    } catch (err) { /* context invalidated (extension disabled) */ }
   });
   (document.body || document.documentElement).appendChild(widgetEl);
   return widgetEl;
-}
-
-/**
- * updateWidgetPanelState: Reposition the widget when the side panel opens or
- *   closes to prevent overlap.
- * WHY IT EXISTS: The extension's side panel occupies 400px on the right side
- *   of the viewport. If the widget is positioned in that area, it would be
- *   obscured by the panel. This function moves the widget to the left when the
- *   panel opens, and restores its original position when the panel closes.
- *   Without this, the widget would be hidden behind the panel, making the
- *   score invisible while the user is interacting with the panel.
- * HOW IT WORKS:
- *   1. If opening: checks if the widget overlaps the panel area. If so, saves
- *      the current position in `prePanelWidgetPos` and moves the widget left
- *      by at least 64px + 18px gap from the panel edge.
- *   2. If closing: restores the saved position from `prePanelWidgetPos` and
- *      clears it.
- * INPUT: isOpen (boolean) — true if the side panel is opening.
- * OUTPUT: Modifies widget position and updates `prePanelWidgetPos`.
- */
-function updateWidgetPanelState(isOpen) {
-  if (!widgetEnabled || !IS_TOP_FRAME) return;
-  const el = ensureWidget();
-  if (!el) return;
-
-  widgetPanelOpen = !!isOpen;
-
-  if (isOpen) {
-    const rect = el.getBoundingClientRect();
-    const sidepanelLeft = window.innerWidth - 400;
-    const widgetRight = rect.left + (el.offsetWidth || 64);
-
-    if (widgetRight > sidepanelLeft) {
-      if (!prePanelWidgetPos) {
-        prePanelWidgetPos = widgetPos
-          ? { x: widgetPos.x, y: widgetPos.y }
-          : { x: rect.left, y: rect.top };
-      }
-      const gap = 18;
-      const newLeft = Math.max(0, sidepanelLeft - 64 - gap);
-      el.style.setProperty("left", newLeft + "px", "important");
-      el.style.setProperty("top", rect.top + "px", "important");
-      el.style.setProperty("right", "auto", "important");
-    }
-  } else {
-    if (prePanelWidgetPos) {
-      widgetPos = { x: prePanelWidgetPos.x, y: prePanelWidgetPos.y };
-      prePanelWidgetPos = null;
-      applyWidgetPosition();
-    }
-  }
 }
 
 /**
@@ -1646,16 +1518,19 @@ function refreshWidget(cookiesSnapshot = null) {
     applyWidgetScore(widgetComputeScore(cookies), delta);
     return;
   }
-  chrome.runtime.sendMessage({ type: "GET_TAB_WIDGET_STATE" }, resp => {
-    if (chrome.runtime.lastError || !resp) return;
-    if (Number.isInteger(resp.tabId)) currentTabId = resp.tabId;
-    const cookies = Array.isArray(resp.cookies) ? resp.cookies : [];
-    const delta = lastWidgetCookieCount > 0 && cookies.length > lastWidgetCookieCount
-      ? cookies.length - lastWidgetCookieCount
-      : 0;
-    lastWidgetCookieCount = cookies.length;
-    applyWidgetScore({ score: resp.score ?? 100, label: resp.scoreLabel ?? "Excellent", total: cookies.length }, delta);
-  });
+  try {
+    chrome.runtime.sendMessage({ type: "GET_TAB_WIDGET_STATE" }, resp => {
+      if (chrome.runtime.lastError || !resp) return;
+      if (Number.isInteger(resp.tabId)) currentTabId = resp.tabId;
+      const cookies = Array.isArray(resp.cookies) ? resp.cookies : [];
+      const delta = lastWidgetCookieCount > 0 && cookies.length > lastWidgetCookieCount
+        ? cookies.length - lastWidgetCookieCount : 0;
+      lastWidgetCookieCount = cookies.length;
+      applyWidgetScore({ score: resp.score ?? 100, label: resp.scoreLabel ?? "Excellent", total: cookies.length }, delta);
+    });
+  } catch (e) {
+    // Extension context invalidated (extension disabled mid-flight).
+  }
 }
 
 let overlayEl = null;
@@ -3042,8 +2917,6 @@ function registerConsentGuard(target) {
  *   - `COOKIES_UPDATED`: Receives updated cookie arrays from the background,
  *     computes delta for the badge, and updates the widget score. Filters by
  *     tabId to avoid updating the wrong tab.
- *   - `PANEL_STATE_CHANGED`: Calls `updateWidgetPanelState()` to reposition
- *     the widget when the side panel opens/closes.
  * INPUT: Message from background/popup with `{ type, ...payload }`.
  * OUTPUT: Calls appropriate handler functions. Some messages return a response.
  */
